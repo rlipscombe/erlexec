@@ -61,6 +61,8 @@
 #include <sys/capability.h>
 #endif
 
+#include <sys/resource.h>
+
 #include <assert.h>
 #include <sys/types.h>
 #include <sys/wait.h>
