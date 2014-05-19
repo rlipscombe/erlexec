@@ -41,8 +41,8 @@
 
 %% External exports
 -export([
-    start/1, start_link/1, run/2, run_link/2, manage/2, send/2,
-    which_children/0, kill/2, stop/1, ospid/1, pid/1, status/1, signal/1
+    start/0, start/1, start_link/1, run/2, run_link/2, manage/2, send/2,
+    which_children/0, kill/2, stop/1, stop_and_wait/2, ospid/1, pid/1, status/1, signal/1
 ]).
 
 %% Internal exports
@@ -163,7 +163,8 @@
     | stdout | stderr
     | {stdout, stderr | output_dev_opt()}
     | {stderr, stdout | output_dev_opt()}
-    | {stdout | stderr, string(), [output_file_opt()]}.
+    | {stdout | stderr, string(), [output_file_opt()]}
+    | pty.
 %% Command options:
 %% <dl>
 %% <dt>monitor</dt><dd>Set up a monitor for the spawned process</dd>
@@ -227,6 +228,8 @@
 %%     <dd>Redirect process's standard error stream</dd>
 %% <dt>{stdout | stderr, Filename::string(), [output_dev_opt()]}</dt>
 %%     <dd>Redirect process's stdout/stderr stream to file</dd>
+%% <dt>pty</dt>
+%%     <dd>Use pseudo terminal for the process's stdin, stdout and stderr</dd>
 %% </dl>
 
 -type output_dev_opt() :: null | close | print | string() | pid()
@@ -268,6 +271,10 @@ start_link(Options) when is_list(Options) ->
 %% @doc Start of an external program manager without supervision.
 %% @end
 %%-------------------------------------------------------------------------
+-spec start() -> {ok, pid()} | {error, any()}.
+start() ->
+    start([]).
+
 -spec start(exec_options()) -> {ok, pid()} | {error, any()}.
 start(Options) when is_list(Options) ->
     gen_server:start({local, ?MODULE}, ?MODULE, [Options], []).
@@ -345,6 +352,34 @@ stop(Pid) when is_pid(Pid); is_integer(Pid) ->
 stop(Port) when is_port(Port) ->
     {os_pid, Pid} = erlang:port_info(Port, os_pid),
     stop(Pid).
+
+%%-------------------------------------------------------------------------
+%% @doc Terminate a managed `Pid', `OsPid', or `Port' process, like
+%% `stop/1`,  and wait for it to exit.
+%% @end
+%%-------------------------------------------------------------------------
+
+-spec stop_and_wait(pid() | ospid() | port(), integer()) -> term() | {error, any()}.
+stop_and_wait(Port, Timeout) when is_port(Port) ->
+    {os_pid, OsPid} = erlang:port_info(Port, os_pid),
+    stop_and_wait(Pid, Timeout);
+
+stop_and_wait(OsPid, Timeout) when is_integer(OsPid) ->
+    [{_, Pid}] = ets:lookup(exec_mon, OsPid),
+    stop_and_wait(Pid, Timeout);
+
+stop_and_wait(Pid, Timeout) when is_pid(Pid) ->
+    gen_server:call(?MODULE, {port, {stop, Pid}}, Timeout),
+    receive
+        {'DOWN', _Ref, process, Pid, ExitStatus} ->
+            ExitStatus
+    after Timeout ->
+            {error, timeout}
+    end;
+
+stop_and_wait(Port, Timeout) when is_port(Port) ->
+    {os_pid, Pid} = erlang:port_info(Port, os_pid),
+    stop_and_wait(Pid, Timeout).
 
 %%-------------------------------------------------------------------------
 %% @doc Get `OsPid' of the given Erlang `Pid'.  The `Pid' must be created
@@ -645,14 +680,14 @@ do_run(Cmd, Options) ->
            end,
     Cmd2 = {port, {Cmd, Link}},
     case {Mon, gen_server:call(?MODULE, Cmd2, 30000)} of
-    {true, {ok, Pid, OsPid} = R} ->
-        Ref = monitor(process, Pid),
-        case Sync of
-        true -> wait_for_ospid_exit(OsPid, Ref, [], []);
-        _    -> R
-        end;
-    {_, R} ->
-        R
+        {true, {ok, Pid, OsPid} = R} ->
+            Ref = monitor(process, Pid),
+            case Sync of
+                true -> wait_for_ospid_exit(OsPid, Ref, [], []);
+                _    -> R
+            end;
+        {_, R} ->
+            R
     end.
 
 wait_for_ospid_exit(OsPid, Ref, OutAcc, ErrAcc) ->
@@ -661,13 +696,14 @@ wait_for_ospid_exit(OsPid, Ref, OutAcc, ErrAcc) ->
         wait_for_ospid_exit(OsPid, Ref, [Data | OutAcc], ErrAcc);
     {stderr, OsPid, Data} ->
         wait_for_ospid_exit(OsPid, Ref, OutAcc, [Data | ErrAcc]);
-    {'DOWN', Ref, process, _, R} ->
-        case R of
-        normal              -> {ok, sync_res(OutAcc, ErrAcc)};
-        noproc              -> {ok, sync_res(OutAcc, ErrAcc)};
-        {exit_status,_}=R   -> {error, [R | sync_res(OutAcc, ErrAcc)]};
-        Other               -> {error, [{reason, Other} | sync_res(OutAcc, ErrAcc)]}
-        end
+    {'DOWN', Ref, process, _, normal} ->
+        {ok, sync_res(OutAcc, ErrAcc)};
+    {'DOWN', Ref, process, _, noproc} ->
+        {ok, sync_res(OutAcc, ErrAcc)};
+    {'DOWN', Ref, process, _, {exit_status,_}=R} ->
+        {error, [R | sync_res(OutAcc, ErrAcc)]};
+    Other ->
+        {error, [{reason, Other} | sync_res(OutAcc, ErrAcc)]}
     end.
 
 sync_res([], []) -> [];
@@ -806,7 +842,7 @@ is_port_command({stop, OsPid}=T, _Pid, _State) when is_integer(OsPid) ->
     {ok, T, undefined, []};
 is_port_command({stop, Pid}, _Pid, _State) when is_pid(Pid) ->
     case ets:lookup(exec_mon, Pid) of
-    [{_Pid, OsPid}] -> {ok, {stop, OsPid}, undefined, []};
+    [{_StoredPid, OsPid}] -> {ok, {stop, OsPid}, undefined, []};
     []              -> throw({error, no_process})
     end;
 is_port_command({{manage, OsPid, Options}, Link}, Pid, State) when is_integer(OsPid) ->
@@ -852,6 +888,8 @@ check_cmd_options([{kill_timeout, I}=H|T], Pid, State, PortOpts, OtherOpts) when
 check_cmd_options([{nice, I}=H|T], Pid, State, PortOpts, OtherOpts) when is_integer(I), I >= -20, I =< 20 ->
     check_cmd_options(T, Pid, State, [H|PortOpts], OtherOpts);
 check_cmd_options([H|T], Pid, State, PortOpts, OtherOpts) when H=:=stdin; H=:=stdout; H=:=stderr ->
+    check_cmd_options(T, Pid, State, [H|PortOpts], [{H, Pid}|OtherOpts]);
+check_cmd_options([H|T], Pid, State, PortOpts, OtherOpts) when H=:=pty ->
     check_cmd_options(T, Pid, State, [H|PortOpts], [{H, Pid}|OtherOpts]);
 check_cmd_options([{stdin, I}=H|T], Pid, State, PortOpts, OtherOpts)
         when I=:=null; I=:=close; is_list(I) ->
@@ -933,7 +971,8 @@ exec_test_() ->
             ?tt(test_executable()),
             ?tt(test_redirect()),
             ?tt(test_env()),
-            ?tt(test_kill_timeout())
+            ?tt(test_kill_timeout()),
+            ?tt(test_pty())
         ]
     }.
 
@@ -1027,6 +1066,18 @@ test_kill_timeout() ->
     {ok, P, I} = exec:run("trap '' SIGTERM; sleep 30", [{kill_timeout, 1}, monitor]),
     exec:stop(I),
     ?receiveMatch({'DOWN', _, process, P, normal}, 5000).
+
+ 
+test_pty() ->
+    ?assertMatch({error,[{exit_status,256},{stdout,[<<"not a tty\n">>]}]},
+        exec:run("tty", [stdin, stdout, sync])),
+    ?assertMatch({ok,[{stdout,[<<"/dev/pts/", _/binary>>]}]},
+        exec:run("tty", [stdin, stdout, pty, sync])),
+    {ok, P, I} = exec:run("/bin/bash --norc -i", [stdin, stdout, pty, monitor]),
+    exec:send(I, <<"echo ok\n">>),
+    ?receiveMatch({stdout, I, <<"ok\r\n">>}, 1000),
+    exec:send(I, <<"exit\n">>),
+    ?receiveMatch({'DOWN', _, process, P, normal}, 1000).
 
 temp_file() ->
     Dir =   case os:getenv("TEMP") of

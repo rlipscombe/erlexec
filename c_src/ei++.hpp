@@ -125,7 +125,7 @@ namespace ei {
         size_t length()     const               { return strlen(base()); }
         void   clear()                          { m_buffer[m_headerSize] = '\0'; }
         /// Free heap allocated memory and shrink buffer to original statically allocated size.
-        void   reset()                          { if (allocated()) delete [] m_buffer; m_buffer = m_buff; clear(); }
+        void   reset()                          { if (allocated()) m_alloc.deallocate(m_buffer, m_size); m_buffer = m_buff; clear(); }
         /// Pointer to a mutable char string of size <capacity()>.
         const char*  c_str() const              { return base(); }
         char*  c_str()                          { return base(); }
@@ -283,6 +283,7 @@ namespace ei {
             return (double)tv.sec() + (double)tv.usec() / 1000000.0;
         }
 
+        void clear()                { m_tv.tv_sec = 0; m_tv.tv_usec = 0; }
         bool zero()                 { return sec() == 0 && usec() == 0; }
         void add(int _sec, int _us) { m_tv.tv_sec += _sec; m_tv.tv_usec += _us; if (_sec || _us) normalize(); }
         TimeVal& now(int addS=0, int addUS=0)   { gettimeofday(&m_tv, NULL); add(addS, addUS); return *this; }
@@ -354,7 +355,7 @@ namespace ei {
         StringBuffer<1024> m_rbuf;  // for reading input commands
         size_t  m_readOffset,   m_writeOffset;
         size_t  m_readPacketSz, m_writePacketSz;
-        int     m_wIdx, m_rIdx, m_rsize;
+        int     m_wIdx, m_rIdx;
         int     m_fin,  m_fout;
         bool    m_debug;
 
@@ -373,7 +374,7 @@ namespace ei {
             : m_wbuf(_headerSz), m_rbuf(_headerSz)
             , m_readOffset(0), m_writeOffset(0)
             , m_readPacketSz(0), m_writePacketSz(0)
-            , m_wIdx(0), m_rIdx(0), m_rsize(0)
+            , m_wIdx(0), m_rIdx(0)
             , m_fin(0), m_fout(1), m_debug(false)
             , tuple(*this)
         {
